@@ -1,0 +1,1679 @@
+import logging
+import asyncio
+import time
+from datetime import datetime
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
+from telegram.ext import (
+   Application,
+   CommandHandler,
+   MessageHandler,
+   CallbackQueryHandler,
+   filters,
+   ConversationHandler,
+   ContextTypes,
+)
+from telegram.request import HTTPXRequest
+from telegram.error import TimedOut, NetworkError
+import pymongo
+from bson import ObjectId
+from telegram.helpers import escape_markdown
+
+# Configure logging
+logging.basicConfig(
+   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+   level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Bot Configuration
+TELEGRAM_TOKEN = "7804499616:AAEVIOp53iDe4byovz955E2wIhVZUgOyHMo"
+MONGODB_URL = "mongodb+srv://Vlad:manreds7@cluster0.d0qnz.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+
+# States
+(GENDER, PURPOSE, NAME, AGE, AGE_RANGE, CITY,
+INTERESTS, INSTAGRAM, MAIN_PHOTO, SELFIE_PHOTO, ADDITIONAL_PHOTO,
+VIEWING_PROFILES, SETTINGS, MY_PROFILE, CONFIRM_RESTART,
+CONFIRM_DELETE, CHANGE_PHOTO, CHANGE_BIO, EDIT_NAME, EDIT_AGE, EDIT_CITY,
+EDIT_INTERESTS, EDIT_INSTAGRAM) = range(23)
+
+class LikeSystem:
+   def __init__(self, db, bot_instance):
+       self.db = db
+       self.likes = db.likes
+       self.matches = db.matches
+       self.users = db.users
+       self.bot = bot_instance
+
+   async def create_like(self, from_user_id, to_user_id):
+       try:
+           # Перевірка на існуючий лайк
+           existing_like = self.likes.find_one({
+               "from_user": from_user_id,
+               "to_user": to_user_id
+           })
+
+           if existing_like:
+               return True, "Ви вже лайкнули цей профіль ❤️"
+
+           # Отримання інформації про користувачів для валідації
+           from_user = self.users.find_one({"user_id": from_user_id, "active": True})
+           to_user = self.users.find_one({"user_id": to_user_id, "active": True})
+
+           if not from_user or not to_user:
+               logger.warning(f"Like between inactive profiles: from={from_user_id}, to={to_user_id}")
+               return False, "Не вдалося поставити лайк. Профіль користувача недоступний."
+
+           # Створення нового лайку
+           like = {
+               "from_user": from_user_id,
+               "to_user": to_user_id,
+               "created_at": datetime.now()
+           }
+           like_result = self.likes.insert_one(like)
+           logger.info(f"New like created: {like_result.inserted_id}")
+
+           # Перевірка на взаємний лайк
+           mutual_like = self.likes.find_one({
+               "from_user": to_user_id,
+               "to_user": from_user_id
+           })
+
+           if mutual_like:
+               # Перевірка на існуючий активний матч, щоб уникнути дублів
+               existing_match = self.matches.find_one({
+                   "users": {"$all": [from_user_id, to_user_id]},
+                   "active": True
+               })
+
+               if not existing_match:
+                   # Створення матчу
+                   match = {
+                       "users": [from_user_id, to_user_id],
+                       "created_at": datetime.now(),
+                       "active": True
+                   }
+                   match_result = self.matches.insert_one(match)
+                   logger.info(f"New match created: {match_result.inserted_id}")
+
+                   # Повертаємо True перед запуском сповіщень, щоб уникнути дублів
+                   result = True, "✨ Це взаємний лайк! ✨\nВи можете почати спілкування 💕"
+
+                   # Асинхронно запускаємо сповіщення, щоб не блокувати основний потік
+                   asyncio.create_task(self.notify_match(from_user, to_user))
+                   asyncio.create_task(self.notify_match(to_user, from_user))
+
+                   return result
+               else:
+                   # Матч вже існує - НЕ відправляємо повідомлення повторно
+                   return True, "✨ Це взаємний лайк! ✨\nВи можете почати спілкування 💕"
+
+           return True, "Лайк надіслано ❤️"
+       except Exception as e:
+           logger.error(f"Error in create_like: {e}")
+           return False, "Виникла помилка при обробці лайку. Спробуйте ще раз."
+
+   async def notify_match(self, user, matched_user):
+       """Відправка сповіщення про новий матч з покращеною обробкою помилок"""
+       max_retries = 3
+       retry_count = 0
+
+       while retry_count < max_retries:
+           try:
+               # Формування профільного тексту
+               profile_text = (
+                   f"✨ НОВИЙ МАТЧ! ✨\n\n"
+                   f"У вас взаємна симпатія з:\n"
+                   f"👤 {matched_user['name']}, {matched_user['age']}\n"
+                   f"🌆 {matched_user['city']}\n"
+                   f"📝 {matched_user['interests']}"
+               )
+
+               # Додавання Instagram, якщо є
+               if 'instagram' in matched_user and matched_user['instagram']:
+                   profile_text += f"\n\n📸 Instagram: @{matched_user['instagram']}"
+
+               # Додавання посилання на контакт
+               username = matched_user.get('username', '')
+               if username:
+                   contact_text = f"\n\n🔗 Почати спілкування: @{username}"
+                   profile_text += contact_text
+               else:
+                   # Якщо немає username, додаємо альтернативний текст
+                   profile_text += "\n\n⚠️ Цей користувач не має username в Telegram."
+                   profile_text += f"\nID користувача: {matched_user['user_id']}"
+
+               # Додаємо статус верифікації
+               if 'selfie_photo' in matched_user:
+                   profile_text += "\n\n✅ Користувач підтвердив фото"
+               else:
+                   profile_text += "\n\n⚠️ Користувач не підтвердив фото"
+
+               # Створюємо кнопки для зручності
+               keyboard = [[InlineKeyboardButton("Переглянути мої пари", callback_data="view_matches")]]
+               reply_markup = InlineKeyboardMarkup(keyboard)
+
+               # Відправка сповіщення з основною фотографією або відео
+               media_sent = False
+
+               if 'main_photo' in matched_user and matched_user['main_photo']:
+                   try:
+                       await self.bot.send_photo(
+                           chat_id=user['user_id'],
+                           photo=matched_user['main_photo'],
+                           caption=profile_text,
+                           reply_markup=reply_markup
+                       )
+                       media_sent = True
+                   except Exception as e:
+                       logger.error(f"Error sending match photo notification: {e}")
+                       # Продовжуємо до наступної спроби відправки
+
+               if not media_sent and 'main_video' in matched_user and matched_user['main_video']:
+                   try:
+                       await self.bot.send_video(
+                           chat_id=user['user_id'],
+                           video=matched_user['main_video'],
+                           caption=profile_text,
+                           reply_markup=reply_markup
+                       )
+                       media_sent = True
+                   except Exception as e:
+                       logger.error(f"Error sending match video notification: {e}")
+                       # Продовжуємо до наступної спроби відправки
+
+               if not media_sent:
+                   # Якщо не вдалося відправити медіа, відправляємо просто текст
+                   await self.bot.send_message(
+                       chat_id=user['user_id'],
+                       text=profile_text,
+                       reply_markup=reply_markup
+                   )
+
+               # Якщо дійшли сюди без помилок, значить сповіщення успішно відправлено
+               logger.info(f"Match notification sent to user {user['user_id']}")
+               return True
+
+           except Exception as e:
+               retry_count += 1
+               logger.error(f"Error in notify_match (attempt {retry_count}): {e}")
+               await asyncio.sleep(1)  # Чекаємо секунду перед наступною спробою
+
+       # Якщо всі спроби не вдалися, робимо останню спробу відправити мінімальне повідомлення
+       try:
+           simple_text = f"✨ У вас новий матч з {matched_user.get('name', 'користувачем')}! ✨\nПеревірте розділ 'Мої пари'."
+           await self.bot.send_message(
+               chat_id=user['user_id'],
+               text=simple_text
+           )
+           logger.info(f"Fallback match notification sent to user {user['user_id']}")
+           return True
+       except Exception as e:
+           logger.error(f"Critical error in notify_match fallback: {e}")
+           return False
+
+class DatingBot:
+   def __init__(self, token, db_url):
+       self.token = token
+       self.client = pymongo.MongoClient(db_url)
+       self.db = self.client.dating_bot
+       self.users = self.db.users
+       self.likes = self.db.likes
+       self.matches = self.db.matches
+       self.bot = None  # Буде встановлено пізніше
+       self.like_system = None  # Буде встановлено пізніше
+
+       try:
+           self.client.server_info()
+           logger.info("Successfully connected to MongoDB")
+       except Exception as e:
+           logger.error(f"Failed to connect to MongoDB: {e}")
+           raise
+
+   def set_bot(self, bot):
+       """Встановлення екземпляра бота після його створення"""
+       self.bot = bot
+       self.like_system = LikeSystem(self.db, bot)
+
+   async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Початок реєстрації з автоматичним очищенням попередніх даних"""
+       user_id = update.effective_user.id
+
+       try:
+           # Видаляємо всі сесії з даними користувача - зберігаємо час видалення
+           delete_time = datetime.now()
+
+           # Відзначаємо старі профілі як неактивні, замість видалення
+           # Це допоможе запобігти показу старих профілів без втрати історії
+           self.users.update_many(
+               {"user_id": user_id},
+               {"$set": {"active": False, "deleted_at": delete_time}}
+           )
+
+           # Видаляємо всі лайки від та до користувача
+           deleted_likes_from = self.likes.delete_many({"from_user": user_id})
+           deleted_likes_to = self.likes.delete_many({"to_user": user_id})
+
+           # Відмічаємо всі матчі з цим користувачем як неактивні
+           updated_matches = self.matches.update_many(
+               {"users": {"$in": [user_id]}},
+               {"$set": {"active": False, "deleted_at": delete_time}}
+           )
+
+           # Логування результатів операцій очищення
+           logger.info(f"Auto-reset for user {user_id}: marked inactive profile, "
+                      f"deleted {deleted_likes_from.deleted_count + deleted_likes_to.deleted_count} likes, "
+                      f"marked inactive {updated_matches.modified_count} matches")
+
+       except Exception as e:
+           logger.error(f"Error during auto-reset in start command: {e}")
+
+       # Очищаємо контекст користувача
+       context.user_data.clear()
+
+       # Зберігаємо username користувача для матчів
+       user = update.effective_user
+       if user.username:
+           context.user_data['username'] = user.username
+
+       # Завжди починаємо реєстрацію з вибору статі
+       keyboard = [
+           [KeyboardButton("Чоловік")],
+           [KeyboardButton("Жінка")]
+       ]
+       reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+       await update.message.reply_text(
+           "Вітаємо! Давайте створимо ваш профіль.\n"
+           "Виберіть вашу стать:",
+           reply_markup=reply_markup
+       )
+       return GENDER
+
+   async def gender(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Обробка вибору статі"""
+       gender = update.message.text
+       context.user_data['gender'] = gender
+
+       keyboard = [
+           [KeyboardButton("Стосунки (показуватимемо тільки осіб протилежної статі)")],
+           [KeyboardButton("Дружба (показуватимемо тільки осіб які обрали варіант дружба)")]
+       ]
+       reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+       await update.message.reply_text(
+           "Яка мета знайомства?",
+           reply_markup=reply_markup
+       )
+       return PURPOSE
+
+   async def purpose(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Обробка вибору мети знайомства"""
+       full_text = update.message.text
+
+       # Витягуємо базову мету (Стосунки/Дружба) без пояснення в дужках
+       if "(" in full_text:
+           purpose = full_text.split("(")[0].strip()
+       else:
+           purpose = full_text.strip()
+
+       context.user_data['purpose'] = purpose
+
+       if purpose == "Стосунки":
+           if context.user_data['gender'] == "Чоловік":
+               context.user_data['looking_for'] = "Жінка"
+           else:
+               context.user_data['looking_for'] = "Чоловік"
+       else:
+           context.user_data['looking_for'] = "Всі"
+
+       await update.message.reply_text(
+           "Як вас звати?",
+           reply_markup=ReplyKeyboardRemove()
+       )
+       return NAME
+
+   async def name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Обробка введення імені"""
+       context.user_data['name'] = update.message.text
+       await update.message.reply_text("Скільки вам років?")
+       return AGE
+
+   async def age(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Обробка введення віку"""
+       try:
+           age = int(update.message.text)
+           if age < 18:
+               await update.message.reply_text("Вам має бути не менше 18 років.")
+               return AGE
+           context.user_data['age'] = age
+
+           await update.message.reply_text(
+               "Вкажіть віковий діапазон для пошуку (наприклад: 20-30):"
+           )
+           return AGE_RANGE
+       except ValueError:
+           await update.message.reply_text("Будь ласка, введіть число.")
+           return AGE
+
+   async def age_range(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Обробка введення вікового діапазону"""
+       try:
+           min_age, max_age = map(int, update.message.text.split('-'))
+           if min_age < 18 or max_age < min_age:
+               await update.message.reply_text(
+                   "Некоректний віковий діапазон. Мінімальний вік - 18 років, "
+                   "максимальний вік повинен бути більше мінімального."
+               )
+               return AGE_RANGE
+
+           context.user_data['age_range'] = {'min': min_age, 'max': max_age}
+           await update.message.reply_text("В якому місті ви знаходитесь?")
+           return CITY
+       except ValueError:
+           await update.message.reply_text(
+               "Будь ласка, введіть діапазон у форматі: мін-макс (наприклад: 20-30)"
+           )
+           return AGE_RANGE
+
+   async def city(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Обробка введення міста"""
+       context.user_data['city'] = update.message.text
+       await update.message.reply_text("Розкажіть про себе та свої інтереси:")
+       return INTERESTS
+
+   async def interests(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Обробка введення інтересів"""
+       context.user_data['interests'] = update.message.text
+
+       keyboard = [[KeyboardButton("Пропустити")]]
+       reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+       await update.message.reply_text(
+           "Вкажіть ваш Instagram (або натисніть 'Пропустити'):",
+           reply_markup=reply_markup
+       )
+       return INSTAGRAM
+
+   async def instagram(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Обробка введення Instagram"""
+       text = update.message.text
+       if text != "Пропустити":
+           # Очищаємо введений нік від @ на початку, якщо є
+           if text.startswith('@'):
+               insta_username = text[1:]
+           else:
+               insta_username = text
+
+           context.user_data['instagram'] = insta_username
+
+       # Меню вибору між фото і відео
+       keyboard = [
+           [KeyboardButton("Додати фото")],
+           [KeyboardButton("Додати відео")]
+       ]
+       reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+       await update.message.reply_text(
+           "Додайте головне медіа для вашого профілю:",
+           reply_markup=reply_markup
+       )
+
+       return MAIN_PHOTO
+
+   async def choose_media_type(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Вибір типу медіа (фото або відео)"""
+       text = update.message.text
+
+       if text == "Додати фото":
+           await update.message.reply_text(
+               "Надішліть своє головне фото:",
+               reply_markup=ReplyKeyboardRemove()
+           )
+           context.user_data['media_type'] = 'photo'
+       elif text == "Додати відео":
+           await update.message.reply_text(
+               "Надішліть своє відео (до 15 секунд):",
+               reply_markup=ReplyKeyboardRemove()
+           )
+           context.user_data['media_type'] = 'video'
+       else:
+           await update.message.reply_text(
+               "Будь ласка, виберіть один з варіантів на клавіатурі."
+           )
+           return MAIN_PHOTO
+
+       return MAIN_PHOTO
+
+   async def main_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Обробка головного фото"""
+       photo_file = await update.message.photo[-1].get_file()
+       context.user_data['main_photo'] = photo_file.file_id
+
+       # Видаляємо відео, якщо воно вже було
+       if 'main_video' in context.user_data:
+           del context.user_data['main_video']
+
+       # Перехід до верифікаційного селфі
+       keyboard = [[KeyboardButton("Пропустити верифікацію")]]
+       reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+       await update.message.reply_text(
+           "Фото додано! Тепер зробіть селфі для верифікації профілю:",
+           reply_markup=reply_markup
+       )
+       return SELFIE_PHOTO
+
+   async def main_video(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Обробка головного відео"""
+       video_file = await update.message.video.get_file()
+       context.user_data['main_video'] = video_file.file_id
+
+       # Видаляємо фото, якщо воно вже було
+       if 'main_photo' in context.user_data:
+           del context.user_data['main_photo']
+
+       # Перехід до верифікаційного селфі
+       keyboard = [[KeyboardButton("Пропустити верифікацію")]]
+       reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+       await update.message.reply_text(
+           "Відео додано! Тепер зробіть селфі для верифікації профілю:",
+           reply_markup=reply_markup
+       )
+       return SELFIE_PHOTO
+
+   async def selfie_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Обробка селфі"""
+       photo_file = await update.message.photo[-1].get_file()
+       context.user_data['selfie_photo'] = photo_file.file_id
+       return await self.prompt_additional_photos(update)
+
+   async def skip_selfie(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Пропуск селфі"""
+       return await self.prompt_additional_photos(update)
+
+   async def prompt_additional_photos(self, update: Update):
+       """Запит на додаткові фото"""
+       keyboard = [
+           [KeyboardButton("Додати фото")],
+           [KeyboardButton("Додати відео")],
+           [KeyboardButton("Завершити реєстрацію")]
+       ]
+       reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+       await update.message.reply_text(
+           "Бажаєте додати ще фото або відео до своєї анкети?",
+           reply_markup=reply_markup
+       )
+       return ADDITIONAL_PHOTO
+
+   async def additional_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Обробка додаткових фото"""
+       if 'additional_photos' not in context.user_data:
+           context.user_data['additional_photos'] = []
+
+       photo_file = await update.message.photo[-1].get_file()
+       context.user_data['additional_photos'].append(photo_file.file_id)
+
+       # Повідомлення про успішне додавання
+       await update.message.reply_text("Фото додано! Бажаєте додати ще медіа?")
+
+       return await self.prompt_additional_photos(update)
+
+   async def additional_video(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Обробка додаткових відео"""
+       if 'additional_videos' not in context.user_data:
+           context.user_data['additional_videos'] = []
+
+       video_file = await update.message.video.get_file()
+       context.user_data['additional_videos'].append(video_file.file_id)
+
+       # Повідомлення про успішне додавання
+       await update.message.reply_text("Відео додано! Бажаєте додати ще медіа?")
+
+       return await self.prompt_additional_photos(update)
+
+   async def handle_additional_photo_choice(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Обробка вибору додавання фото/відео або завершення реєстрації"""
+       logger.info(f"Received message text: '{update.message.text}'")
+       text = update.message.text
+
+       if text == "Завершити реєстрацію":
+           try:
+               user_id = update.effective_user.id
+               user_data = context.user_data.copy()
+               user_data['user_id'] = user_id
+               user_data['active'] = True  # Позначаємо профіль як активний
+               user_data['created_at'] = datetime.now()
+
+               # Зберігаємо username для посилань на контакт при матчах
+               if update.effective_user.username:
+                   user_data['username'] = update.effective_user.username
+
+               # Спочатку відзначаємо всі старі профілі користувача як неактивні
+               self.users.update_many(
+                   {"user_id": user_id, "active": True},
+                   {"$set": {"active": False, "deleted_at": datetime.now()}}
+               )
+
+               # Тепер створюємо новий профіль
+               result = self.users.insert_one(user_data)
+               logger.info(f"Inserted new user with id: {result.inserted_id}")
+
+               # Відправляємо чіткий роздільник між реєстрацією та переглядом анкет
+               divider = "=" * 30
+               welcome_message = (
+                   f"{divider}\n\n"
+                   f"✅ Реєстрація успішно завершена! ✅\n\n"
+                   f"Тепер ви можете почати перегляд анкет і знаходити нові знайомства.\n\n"
+                   f"{divider}"
+               )
+
+               await update.message.reply_text(welcome_message)
+
+               # Нове меню з емодзі кнопками
+               keyboard = [
+                   [KeyboardButton("👤 Дивитись анкети")],
+                   [KeyboardButton("❤️ Мої лайки")],
+                   [KeyboardButton("📝 Мої пари")],
+                   [KeyboardButton("⚙️ Налаштування")]
+               ]
+               reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+               await update.message.reply_text(
+                   "Оберіть потрібну опцію:",
+                   reply_markup=reply_markup
+               )
+
+               # Показуємо першу анкету одразу після реєстрації
+               # Щоб користувач зрозумів, як це працює
+               return await self.handle_view_profiles(update, context)
+           except Exception as e:
+               logger.error(f"Error in completing registration: {e}")
+               await update.message.reply_text("Виникла помилка. Спробуйте ще раз.")
+               return ADDITIONAL_PHOTO
+       elif text == "Додати фото":
+           await update.message.reply_text("Надішліть ще одне фото:")
+           return ADDITIONAL_PHOTO
+       elif text == "Додати відео":
+           await update.message.reply_text("Надішліть відео (до 15 секунд):")
+           return ADDITIONAL_PHOTO
+       else:
+           await update.message.reply_text("Будь ласка, виберіть один з варіантів на клавіатурі.")
+           return ADDITIONAL_PHOTO
+
+   async def view_likes(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Перегляд отриманих лайків"""
+       user_id = update.effective_user.id
+       try:
+           # Забираємо ReplyKeyboard на час показу лайків
+           await update.message.reply_text(
+               "Ваші лайки:",
+               reply_markup=ReplyKeyboardRemove()
+           )
+
+           likes = list(self.likes.find({"to_user": user_id}))
+
+           if not likes:
+               await update.message.reply_text("У вас поки немає лайків.")
+           else:
+               for like in likes:
+                   # Шукаємо тільки активні профілі
+                   liker = self.users.find_one({"user_id": like['from_user'], "active": True})
+                   if liker:
+                       profile_text = (
+                           f"👤 {liker.get('name', 'Невідомий користувач')}, {liker.get('age', '?')}\n"
+                           f"🌆 {liker.get('city', 'Невідоме місто')}\n"
+                           f"📝 {liker.get('interests', 'Немає інформації')}"
+                       )
+
+                       # Додаємо Instagram, якщо є
+                       if 'instagram' in liker and liker['instagram']:
+                           insta_username = liker['instagram']
+                           profile_text += f"\n📸 Instagram: @{insta_username}"
+
+                       # Додаємо статус верифікації
+                       if 'selfie_photo' in liker:
+                           profile_text += "\n\n✅ Користувач підтвердив фото"
+                       else:
+                           profile_text += "\n\n⚠️ Користувач не підтвердив фото"
+
+                       # Додаємо час, коли був поставлений лайк
+                       if 'created_at' in like:
+                           like_time = like['created_at']
+                           profile_text += f"\n\n🕒 Лайк отримано: {like_time.strftime('%d.%m.%Y %H:%M')}"
+
+                       # Відправляємо фото або відео, якщо є
+                       media_sent = False
+
+                       if 'main_photo' in liker and liker['main_photo']:
+                           try:
+                               await update.message.reply_photo(liker['main_photo'], caption=profile_text)
+                               media_sent = True
+                           except Exception as e:
+                               logger.error(f"Error sending liker photo: {e}")
+
+                       if not media_sent and 'main_video' in liker and liker['main_video']:
+                           try:
+                               await update.message.reply_video(liker['main_video'], caption=profile_text)
+                               media_sent = True
+                           except Exception as e:
+                               logger.error(f"Error sending liker video: {e}")
+
+                       if not media_sent:
+                           await update.message.reply_text(profile_text)
+
+           # Повертаємо клавіатуру після показу всіх лайків
+           keyboard = [
+               [KeyboardButton("👤 Дивитись анкети")],
+               [KeyboardButton("❤️ Мої лайки")],
+               [KeyboardButton("📝 Мої пари")],
+               [KeyboardButton("⚙️ Налаштування")]
+           ]
+           reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+           await update.message.reply_text(
+               "Продовжити:",
+               reply_markup=reply_markup
+           )
+       except Exception as e:
+           logger.error(f"Error viewing likes: {e}")
+           await update.message.reply_text("Виникла помилка при перегляді лайків.")
+
+       return VIEWING_PROFILES
+
+   async def view_matches(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Перегляд матчів з покращеним відображенням"""
+       user_id = update.effective_user.id
+       try:
+           # Забираємо ReplyKeyboard на час показу матчів
+           await update.message.reply_text(
+               "Ваші пари:",
+               reply_markup=ReplyKeyboardRemove()
+           )
+
+           # Шукаємо тільки активні матчі
+           matches = list(self.matches.find({
+               "users": {"$in": [user_id]},
+               "active": True
+           }))
+
+           if not matches:
+               await update.message.reply_text(
+                   "У вас поки немає пар. Почніть лайкати профілі, щоб знайти пару!"
+               )
+           else:
+               await update.message.reply_text(
+                   f"У вас {len(matches)} пар{'и' if 1 < len(matches) < 5 else ''}. "
+                   f"Ось всі ваші матчі:"
+               )
+
+               for match in matches:
+                   try:
+                       other_user_id = next((uid for uid in match['users'] if uid != user_id), None)
+                       if not other_user_id:
+                           continue
+
+                       # Шукаємо тільки активні профілі
+                       other_user = self.users.find_one({
+                           "user_id": other_user_id,
+                           "active": True
+                       })
+
+                       if not other_user:
+                           # Якщо профіль неактивний, пропускаємо
+                           continue
+
+                       profile_text = (
+                           f"👤 {other_user.get('name', 'Невідомий користувач')}, {other_user.get('age', '?')}\n"
+                           f"🌆 {other_user.get('city', 'Невідоме місто')}\n"
+                           f"📝 {other_user.get('interests', 'Немає інформації')}"
+                       )
+
+                       # Додаємо Instagram, якщо є
+                       if 'instagram' in other_user and other_user['instagram']:
+                           insta_username = other_user['instagram']
+                           profile_text += f"\n📸 Instagram: @{insta_username}"
+
+                       # Додаємо статус верифікації
+                       if 'selfie_photo' in other_user:
+                           profile_text += "\n\n✅ Користувач підтвердив фото"
+                       else:
+                           profile_text += "\n\n⚠️ Користувач не підтвердив фото"
+
+                       # Додаємо контакт, якщо є username
+                       if 'username' in other_user and other_user['username']:
+                           username = other_user['username']
+                           profile_text += f"\n\n🔗 Контакт: @{username}"
+                       else:
+                           profile_text += "\n\n⚠️ У цього користувача немає доступного username."
+                           profile_text += f"\nID користувача: {other_user['user_id']}"
+
+                       # Додаємо інформацію про час матчу
+                       match_time = match.get('created_at', datetime.now())
+                       profile_text += f"\n\n🕒 Матч створено: {match_time.strftime('%d.%m.%Y %H:%M')}"
+
+                       # Відправляємо фото або відео, якщо є
+                       media_sent = False
+
+                       if 'main_photo' in other_user and other_user['main_photo']:
+                           try:
+                               await update.message.reply_photo(other_user['main_photo'], caption=profile_text)
+                               media_sent = True
+                           except Exception as e:
+                               logger.error(f"Error sending match photo: {e}")
+
+                       if not media_sent and 'main_video' in other_user and other_user['main_video']:
+                           try:
+                               await update.message.reply_video(other_user['main_video'], caption=profile_text)
+                               media_sent = True
+                           except Exception as e:
+                               logger.error(f"Error sending match video: {e}")
+
+                       if not media_sent:
+                           await update.message.reply_text(profile_text)
+                   except Exception as e:
+                       logger.error(f"Error processing match: {e}")
+                       continue
+
+           # Повертаємо клавіатуру після показу всіх матчів
+           keyboard = [
+               [KeyboardButton("👤 Дивитись анкети")],
+               [KeyboardButton("❤️ Мої лайки")],
+               [KeyboardButton("📝 Мої пари")],
+               [KeyboardButton("⚙️ Налаштування")]
+           ]
+           reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+           await update.message.reply_text(
+               "Продовжити:",
+               reply_markup=reply_markup
+           )
+       except Exception as e:
+           logger.error(f"Error viewing matches: {e}")
+           await update.message.reply_text("Виникла помилка при перегляді пар.")
+
+           # Повертаємо клавіатуру
+           keyboard = [
+               [KeyboardButton("👤 Дивитись анкети")],
+               [KeyboardButton("❤️ Мої лайки")],
+               [KeyboardButton("📝 Мої пари")],
+               [KeyboardButton("⚙️ Налаштування")]
+           ]
+           reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+           await update.message.reply_text(
+               "Головне меню:",
+               reply_markup=reply_markup
+           )
+
+       return VIEWING_PROFILES
+
+   async def settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Налаштування профілю"""
+       keyboard = [
+           [KeyboardButton("💎 Преміум акаунт")],
+           [KeyboardButton("🚀 Буст акаунту")],
+           [KeyboardButton("👤 Моя анкета")],
+           [KeyboardButton("🗑️ Видалити анкету")],  # Додана кнопка видалення
+           [KeyboardButton("🔙 Назад")]
+       ]
+       reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+       await update.message.reply_text(
+           "Налаштування:",
+           reply_markup=reply_markup
+       )
+       return SETTINGS
+
+   async def back_to_main_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Повернення до головного меню"""
+       keyboard = [
+           [KeyboardButton("👤 Дивитись анкети")],
+           [KeyboardButton("❤️ Мої лайки")],
+           [KeyboardButton("📝 Мої пари")],
+           [KeyboardButton("⚙️ Налаштування")]
+       ]
+       reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+       await update.message.reply_text(
+           "Головне меню:",
+           reply_markup=reply_markup
+       )
+       return VIEWING_PROFILES
+
+   async def show_my_profile(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Показ власного профілю з можливістю редагування"""
+       keyboard = [
+           [KeyboardButton("🔄 Заповнити анкету наново")],
+           [KeyboardButton("📸 Змінити фото/відео")],
+           [KeyboardButton("✏️ Змінити текст анкети")],
+           [KeyboardButton("🔙 Назад")]
+       ]
+       reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+       await update.message.reply_text(
+           "Моя анкета - опції редагування:",
+           reply_markup=reply_markup
+       )
+
+       # Показуємо поточний профіль
+       user_id = update.effective_user.id
+       user = self.users.find_one({"user_id": user_id, "active": True})
+
+       if user:
+           profile_text = (
+               f"👤 {user.get('name', 'Невідомий')}, {user.get('age', '?')}\n"
+               f"🌆 {user.get('city', 'Невідоме місто')}\n"
+               f"🎯 {user.get('purpose', 'Не вказано')}\n\n"
+               f"📝 {user.get('interests', 'Немає інформації')}"
+           )
+
+           if 'instagram' in user and user['instagram']:
+               profile_text += f"\n\n📸 Instagram: @{user['instagram']}"
+
+           # Додаємо статус верифікації
+           if 'selfie_photo' in user:
+               profile_text += "\n\n✅ Ви підтвердили фото"
+           else:
+               profile_text += "\n\n⚠️ Ви не підтвердили фото"
+
+           # Відправляємо фото або відео профілю з перевіркою на помилки
+           media_sent = False
+
+           if 'main_photo' in user and user['main_photo']:
+               try:
+                   await update.message.reply_photo(
+                       user['main_photo'],
+                       caption=profile_text
+                   )
+                   media_sent = True
+               except Exception as e:
+                   logger.error(f"Error sending own profile photo: {e}")
+
+           if not media_sent and 'main_video' in user and user['main_video']:
+               try:
+                   await update.message.reply_video(
+                       user['main_video'],
+                       caption=profile_text
+                   )
+                   media_sent = True
+               except Exception as e:
+                   logger.error(f"Error sending own profile video: {e}")
+
+           if not media_sent:
+               await update.message.reply_text(profile_text)
+
+       return MY_PROFILE
+
+   async def confirm_restart_profile(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Підтвердження перезаповнення анкети"""
+       keyboard = [
+           [KeyboardButton("✅ Так, хочу створити нову анкету")],
+           [KeyboardButton("❌ Ні, повернутись назад")]
+       ]
+       reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+       await update.message.reply_text(
+           "⚠️ Ви впевнені, що хочете заповнити анкету наново? Ваші поточні дані будуть замінені.",
+           reply_markup=reply_markup
+       )
+
+       return CONFIRM_RESTART
+
+   async def change_profile_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Зміна фото профілю"""
+       keyboard = [
+           [KeyboardButton("Додати нове фото")],
+           [KeyboardButton("Додати нове відео")],
+           [KeyboardButton("🔙 Назад")]
+       ]
+       reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+       await update.message.reply_text(
+           "Оберіть, що бажаєте зробити з фото/відео вашого профілю:",
+           reply_markup=reply_markup
+       )
+
+       return CHANGE_PHOTO
+
+   async def handle_change_photo_choice(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Обробка вибору для зміни фото/відео"""
+       text = update.message.text
+
+       if text == "Додати нове фото":
+           await update.message.reply_text(
+               "Надішліть нове фото для вашого профілю:",
+               reply_markup=ReplyKeyboardRemove()
+           )
+           context.user_data['changing_media'] = 'photo'
+           return CHANGE_PHOTO
+       elif text == "Додати нове відео":
+           await update.message.reply_text(
+               "Надішліть нове відео (до 15 секунд) для вашого профілю:",
+               reply_markup=ReplyKeyboardRemove()
+           )
+           context.user_data['changing_media'] = 'video'
+           return CHANGE_PHOTO
+       elif text == "🔙 Назад":
+           return await self.show_my_profile(update, context)
+       else:
+           await update.message.reply_text("Будь ласка, виберіть один з варіантів на клавіатурі.")
+           return CHANGE_PHOTO
+
+   async def update_profile_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Оновлення фото профілю"""
+       user_id = update.effective_user.id
+
+       try:
+           photo_file = await update.message.photo[-1].get_file()
+           file_id = photo_file.file_id
+
+           # Оновлюємо фото в базі даних
+           self.users.update_one(
+               {"user_id": user_id, "active": True},
+               {"$set": {"main_photo": file_id}, "$unset": {"main_video": ""}}
+           )
+
+           await update.message.reply_text(
+               "Фото профілю успішно оновлено! ✅"
+           )
+
+           # Повертаємось до меню профілю
+           return await self.show_my_profile(update, context)
+       except Exception as e:
+           logger.error(f"Error updating profile photo: {e}")
+           await update.message.reply_text("Виникла помилка при оновленні фото.")
+           return await self.show_my_profile(update, context)
+
+   async def update_profile_video(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Оновлення відео профілю"""
+       user_id = update.effective_user.id
+
+       try:
+           video_file = await update.message.video.get_file()
+           file_id = video_file.file_id
+
+           # Оновлюємо відео в базі даних
+           self.users.update_one(
+               {"user_id": user_id, "active": True},
+               {"$set": {"main_video": file_id}, "$unset": {"main_photo": ""}}
+           )
+
+           await update.message.reply_text(
+               "Відео профілю успішно оновлено! ✅"
+           )
+
+           # Повертаємось до меню профілю
+           return await self.show_my_profile(update, context)
+       except Exception as e:
+           logger.error(f"Error updating profile video: {e}")
+           await update.message.reply_text("Виникла помилка при оновленні відео.")
+           return await self.show_my_profile(update, context)
+
+   async def change_bio(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Зміна текстової інформації профілю"""
+       keyboard = [
+           [KeyboardButton("Змінити ім'я")],
+           [KeyboardButton("Змінити вік")],
+           [KeyboardButton("Змінити місто")],
+           [KeyboardButton("Змінити опис")],
+           [KeyboardButton("Змінити Instagram")],
+           [KeyboardButton("🔙 Назад")]
+       ]
+       reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+       await update.message.reply_text(
+           "Оберіть, яку інформацію ви бажаєте змінити:",
+           reply_markup=reply_markup
+       )
+
+       return CHANGE_BIO
+
+   async def edit_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Зміна імені"""
+       await update.message.reply_text(
+           "Введіть нове ім'я:",
+           reply_markup=ReplyKeyboardRemove()
+       )
+       return EDIT_NAME
+
+   async def save_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Збереження нового імені"""
+       new_name = update.message.text
+       user_id = update.effective_user.id
+
+       self.users.update_one(
+           {"user_id": user_id, "active": True},
+           {"$set": {"name": new_name}}
+       )
+
+       await update.message.reply_text("Ім'я успішно змінено! ✅")
+       return await self.change_bio(update, context)
+
+   async def edit_age(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Зміна віку"""
+       await update.message.reply_text(
+           "Введіть новий вік:",
+           reply_markup=ReplyKeyboardRemove()
+       )
+       return EDIT_AGE
+
+   async def save_age(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Збереження нового віку"""
+       try:
+           new_age = int(update.message.text)
+           if new_age < 18:
+               await update.message.reply_text("Вам має бути не менше 18 років.")
+               return EDIT_AGE
+
+           user_id = update.effective_user.id
+           self.users.update_one(
+               {"user_id": user_id, "active": True},
+               {"$set": {"age": new_age}}
+           )
+
+           await update.message.reply_text("Вік успішно змінено! ✅")
+           return await self.change_bio(update, context)
+       except ValueError:
+           await update.message.reply_text("Будь ласка, введіть число.")
+           return EDIT_AGE
+
+   async def edit_city(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Зміна міста"""
+       await update.message.reply_text(
+           "Введіть нове місто:",
+           reply_markup=ReplyKeyboardRemove()
+       )
+       return EDIT_CITY
+
+   async def save_city(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Збереження нового міста"""
+       new_city = update.message.text
+       user_id = update.effective_user.id
+
+       self.users.update_one(
+           {"user_id": user_id, "active": True},
+           {"$set": {"city": new_city}}
+       )
+
+       await update.message.reply_text("Місто успішно змінено! ✅")
+       return await self.change_bio(update, context)
+
+   async def edit_interests(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Зміна інтересів"""
+       await update.message.reply_text(
+           "Введіть новий опис себе та своїх інтересів:",
+           reply_markup=ReplyKeyboardRemove()
+       )
+       return EDIT_INTERESTS
+
+   async def save_interests(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Збереження нових інтересів"""
+       new_interests = update.message.text
+       user_id = update.effective_user.id
+
+       self.users.update_one(
+           {"user_id": user_id, "active": True},
+           {"$set": {"interests": new_interests}}
+       )
+
+       await update.message.reply_text("Опис успішно змінено! ✅")
+       return await self.change_bio(update, context)
+
+   async def edit_instagram(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Зміна Instagram"""
+       await update.message.reply_text(
+           "Введіть новий Instagram (або 'Видалити' щоб видалити):",
+           reply_markup=ReplyKeyboardRemove()
+       )
+       return EDIT_INSTAGRAM
+
+   async def save_instagram(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Збереження нового Instagram"""
+       text = update.message.text
+       user_id = update.effective_user.id
+
+       if text.lower() == "видалити":
+           self.users.update_one(
+               {"user_id": user_id, "active": True},
+               {"$unset": {"instagram": ""}}
+           )
+           await update.message.reply_text("Instagram видалено з профілю! ✅")
+       else:
+           # Очищаємо введений нік від @ на початку, якщо є
+           if text.startswith('@'):
+               insta_username = text[1:]
+           else:
+               insta_username = text
+
+           self.users.update_one(
+               {"user_id": user_id, "active": True},
+               {"$set": {"instagram": insta_username}}
+           )
+           await update.message.reply_text("Instagram успішно змінено! ✅")
+
+       return await self.change_bio(update, context)
+
+   async def confirm_delete_profile(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Підтвердження видалення профілю"""
+       keyboard = [
+           [KeyboardButton("✅ Так, видалити мій профіль")],
+           [KeyboardButton("❌ Ні, повернутись назад")]
+       ]
+       reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+       await update.message.reply_text(
+           "⚠️ Ви впевнені, що хочете видалити свій профіль? Ця дія незворотна.\n\n"
+           "Ваш профіль, лайки та матчі будуть повністю видалені.",
+           reply_markup=reply_markup
+       )
+
+       return CONFIRM_DELETE
+
+   async def handle_restart_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Обробка підтвердження перезаповнення анкети"""
+       text = update.message.text
+
+       if text == "✅ Так, хочу створити нову анкету":
+           # Запускаємо процес реєстрації заново
+           await update.message.reply_text(
+               "Починаємо заповнення анкети заново..."
+           )
+           return await self.start(update, context)
+       else:
+           # Повертаємось до налаштувань
+           return await self.show_my_profile(update, context)
+
+   async def handle_delete_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Обробка підтвердження видалення анкети"""
+       text = update.message.text
+
+       if text == "✅ Так, видалити мій профіль":
+           user_id = update.effective_user.id
+
+           try:
+               # Відзначаємо профіль як неактивний замість видалення
+               updated_profile = self.users.update_many(
+                   {"user_id": user_id},
+                   {"$set": {"active": False, "deleted_at": datetime.now()}}
+               )
+
+               # Видаляємо всі лайки від та до користувача
+               deleted_likes_from = self.likes.delete_many({"from_user": user_id})
+               deleted_likes_to = self.likes.delete_many({"to_user": user_id})
+
+               # Відмічаємо всі матчі з цим користувачем як неактивні
+               updated_matches = self.matches.update_many(
+                   {"users": {"$in": [user_id]}},
+                   {"$set": {"active": False, "deleted_at": datetime.now()}}
+               )
+
+               # Логування результатів операцій
+               logger.info(f"Delete profile for user {user_id}: marked inactive {updated_profile.modified_count} profile, "
+                         f"deleted {deleted_likes_from.deleted_count + deleted_likes_to.deleted_count} likes, "
+                         f"marked inactive {updated_matches.modified_count} matches")
+
+               # Очищення контексту
+               context.user_data.clear()
+
+               # Повідомлення про видалення
+               await update.message.reply_text(
+                   "💔 Ваш профіль видалено. Щоб створити новий профіль, використайте команду /start."
+               )
+
+               # Заміняємо клавіатуру на просту кнопку /start
+               keyboard = [
+                   [KeyboardButton("/start")]
+               ]
+               reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+               await update.message.reply_text(
+                   "Натисніть /start, щоб зареєструватися знову:",
+                   reply_markup=reply_markup
+               )
+           except Exception as e:
+               logger.error(f"Error deleting profile: {e}")
+               await update.message.reply_text("Виникла помилка при видаленні профілю. Спробуйте ще раз або зверніться до підтримки.")
+
+           return ConversationHandler.END
+       else:
+           # Повертаємось до налаштувань
+           await update.message.reply_text("Операцію скасовано.")
+           return await self.settings(update, context)
+
+   async def handle_view_profiles(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Обробка перегляду профілів з InlineKeyboardMarkup замість ReplyKeyboardMarkup"""
+       user_id = update.effective_user.id
+       try:
+           # Спочатку перевіряємо чи є користувач в базі
+           user = self.users.find_one({"user_id": user_id, "active": True})
+           if not user:
+               await update.message.reply_text("Будь ласка, спочатку завершіть реєстрацію.")
+               return VIEWING_PROFILES
+
+           # Логування запиту для діагностики
+           logger.info(f"Looking for profiles for user {user_id} with purpose: {user.get('purpose', 'Not specified')}")
+
+           # Отримуємо список ID користувачів, яких вже лайкнули
+           liked_users_cursor = self.likes.find({"from_user": user_id})
+           viewed_profiles = [like['to_user'] for like in liked_users_cursor]
+           viewed_profiles.append(user_id)  # Додаємо власний ID
+
+           # Побудова базового запиту - лише активні профілі
+           base_query = {
+               "user_id": {"$nin": viewed_profiles},
+               "active": True,  # Лише активні профілі
+               "name": {"$exists": True},
+               "age": {"$exists": True}
+           }
+
+           # Додаємо фільтрацію за метою знайомства та статтю
+           if user.get('purpose') == "Стосунки" and user.get('looking_for') != "Всі":
+               base_query["gender"] = user.get('looking_for')
+           elif user.get('purpose') == "Дружба":
+               # Для дружби показуємо тільки тих, хто теж шукає дружбу
+               base_query["purpose"] = "Дружба"
+
+           # Додаємо фільтр за віковим діапазоном, якщо він вказаний
+           if 'age_range' in user:
+               min_age = user['age_range'].get('min', 18)
+               max_age = user['age_range'].get('max', 100)
+               base_query["age"] = {"$gte": min_age, "$lte": max_age}
+
+           # Пошук потенційного матчу
+           potential_match = self.users.find_one(base_query)
+
+           # Якщо не знайшли, спробуємо спростити умови пошуку
+           if not potential_match:
+               logger.info("No profiles found with full criteria, simplifying search...")
+               # Залишаємо тільки базові умови і видаляємо додаткові фільтри
+               simplified_query = {
+                   "user_id": {"$nin": viewed_profiles},
+                   "active": True,  # Все одно шукаємо лише активні профілі
+                   "name": {"$exists": True}
+               }
+               potential_match = self.users.find_one(simplified_query)
+
+           # Якщо все ще не знайшли, спробуємо знайти будь-який активний профіль
+           if not potential_match:
+               logger.info("No profiles found with basic criteria, searching any active user...")
+               potential_match = self.users.find_one({
+                   "user_id": {"$ne": user_id},
+                   "active": True
+               })
+
+           # Якщо все ще немає відповідних профілів
+           if not potential_match:
+               logger.info("No profiles found at all")
+               await update.message.reply_text(
+                   "На жаль, зараз немає нових профілів для перегляду. Спробуйте пізніше!"
+               )
+
+               # Повертаємо клавіатуру
+               keyboard = [
+                   [KeyboardButton("👤 Дивитись анкети")],
+                   [KeyboardButton("❤️ Мої лайки")],
+                   [KeyboardButton("📝 Мої пари")],
+                   [KeyboardButton("⚙️ Налаштування")]
+               ]
+               reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+               await update.message.reply_text("Головне меню:", reply_markup=reply_markup)
+
+               return VIEWING_PROFILES
+
+           # Перевіряємо чи має профіль всі необхідні поля
+           if 'user_id' not in potential_match:
+               logger.warning(f"Found profile without user_id field: {potential_match}")
+               await update.message.reply_text(
+                   "На жаль, виникла проблема з анкетою. Спробуйте пізніше!"
+               )
+               return VIEWING_PROFILES
+
+           logger.info(f"Found potential match: {potential_match.get('name', 'Unknown')}")
+
+           # Формуємо профіль з перевіркою на наявність полів
+           profile_text = (
+               f"👤 {potential_match.get('name', 'Невідомий')}, {potential_match.get('age', '?')}\n"
+               f"🌆 {potential_match.get('city', 'Невідоме місто')}\n"
+           )
+
+           # Додаємо мету, якщо є
+           if 'purpose' in potential_match:
+               profile_text += f"🎯 {potential_match['purpose']}\n\n"
+           else:
+               profile_text += f"🎯 Не вказано\n\n"
+
+           # Додаємо інтереси, якщо є
+           if 'interests' in potential_match and potential_match['interests']:
+               profile_text += f"📝 {potential_match['interests']}"
+           else:
+               profile_text += "📝 Немає інформації"
+
+           # Додаємо Instagram, якщо є
+           if 'instagram' in potential_match and potential_match['instagram']:
+               profile_text += f"\n\n📸 Instagram: @{potential_match['instagram']}"
+
+           # Додаємо статус верифікації
+           if 'selfie_photo' in potential_match:
+               profile_text += "\n\n✅ Користувач підтвердив фото"
+           else:
+               profile_text += "\n\n⚠️ Користувач не підтвердив фото"
+
+           # Прибираємо клавіатуру перед показом анкети
+           await update.message.reply_text(
+               "Знайдено анкету:",
+               reply_markup=ReplyKeyboardRemove()
+           )
+
+           # Відправка медіа з перевіркою на помилки
+           media_sent = False
+
+           # Спроба відправити головне фото
+           if 'main_photo' in potential_match and potential_match['main_photo']:
+               try:
+                   await update.message.reply_photo(
+                       potential_match['main_photo'],
+                       caption=profile_text
+                   )
+                   media_sent = True
+               except Exception as e:
+                   logger.error(f"Error sending profile main photo: {e}")
+
+           # Якщо фото не вдалося відправити, пробуємо відправити відео
+           if not media_sent and 'main_video' in potential_match and potential_match['main_video']:
+               try:
+                   await update.message.reply_video(
+                       potential_match['main_video'],
+                       caption=profile_text
+                   )
+                   media_sent = True
+               except Exception as e:
+                   logger.error(f"Error sending profile main video: {e}")
+
+           # Якщо не вдалося відправити ні фото, ні відео
+           if not media_sent:
+               await update.message.reply_text(profile_text)
+
+           # Відправляємо додаткові фото, якщо є
+           if 'additional_photos' in potential_match and potential_match['additional_photos']:
+               media_group = []
+
+               for photo_id in potential_match['additional_photos']:
+                   try:
+                       if photo_id:  # Перевіряємо, що ID не пустий
+                           media_group.append(InputMediaPhoto(photo_id))
+                   except Exception as e:
+                       logger.error(f"Error adding photo to media group: {e}")
+
+               if media_group:
+                   try:
+                       await update.message.reply_media_group(media_group)
+                   except Exception as e:
+                       logger.error(f"Error sending media group: {e}")
+
+           # Відправляємо додаткові відео окремо, якщо є
+           if 'additional_videos' in potential_match and potential_match['additional_videos']:
+               for video_id in potential_match['additional_videos']:
+                   try:
+                       if video_id:  # Перевіряємо, що ID не пустий
+                           await update.message.reply_video(video_id)
+                   except Exception as e:
+                       logger.error(f"Error sending additional video: {e}")
+
+           # Замінюємо звичайні кнопки на інлайн-кнопки (під анкетою)
+           keyboard = [
+               [
+                   InlineKeyboardButton("❤️", callback_data=f"like_{potential_match['user_id']}"),
+                   InlineKeyboardButton("💌", callback_data=f"message_{potential_match['user_id']}"),
+                   InlineKeyboardButton("➡️", callback_data="next")
+               ]
+           ]
+           reply_markup = InlineKeyboardMarkup(keyboard)
+
+           # Зберігаємо ID поточного профілю в context
+           context.user_data['current_profile_id'] = potential_match['user_id']
+
+           # Відправляємо інлайн-кнопки з дією
+           await update.message.reply_text(
+               "Оберіть дію:",
+               reply_markup=reply_markup
+           )
+
+       except Exception as e:
+           logger.error(f"Error viewing profiles: {e}")
+           await update.message.reply_text("Виникла помилка при перегляді профілів.")
+
+           # Повертаємо основну клавіатуру
+           keyboard = [
+               [KeyboardButton("👤 Дивитись анкети")],
+               [KeyboardButton("❤️ Мої лайки")],
+               [KeyboardButton("📝 Мої пари")],
+               [KeyboardButton("⚙️ Налаштування")]
+           ]
+           reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+           await update.message.reply_text("Спробуйте ще раз:", reply_markup=reply_markup)
+
+       return VIEWING_PROFILES
+
+   async def handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+       """Обробка callback-запитів від інлайн кнопок"""
+       query = update.callback_query
+
+       try:
+           # Надсилаємо відповідь на callback, щоб прибрати "годинник завантаження"
+           await query.answer()
+
+           if query.data == "view_matches":
+               # Переходимо до перегляду матчів
+               await query.message.reply_text("Переходимо до ваших пар...")
+               return await self.view_matches(update, context)
+
+           elif query.data.startswith('like_'):
+               user_id = int(query.data.split('_')[1])
+               # Отримуємо ID користувача, якому ставимо лайк
+               success, message = await self.like_system.create_like(
+                   query.from_user.id,
+                   user_id
+               )
+               # Повідомляємо про результат
+               await query.message.reply_text(message)
+
+               # Показуємо наступну анкету або повертаємося в головне меню
+               if "взаємний лайк" in message:
+                   # Повертаємося в головне меню після взаємного лайку
+                   keyboard = [
+                       [KeyboardButton("👤 Дивитись анкети")],
+                       [KeyboardButton("❤️ Мої лайки")],
+                       [KeyboardButton("📝 Мої пари")],
+                       [KeyboardButton("⚙️ Налаштування")]
+                   ]
+                   reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+                   await query.message.reply_text("Головне меню:", reply_markup=reply_markup)
+                   return VIEWING_PROFILES
+               else:
+                   # Показуємо наступну анкету після звичайного лайку
+                   return await self.handle_view_profiles(update, context)
+
+           elif query.data.startswith('message_'):
+               user_id = int(query.data.split('_')[1])
+               user = self.users.find_one({"user_id": user_id, "active": True})
+
+               if user and 'username' in user and user['username']:
+                   username = user['username']
+                   message = f"Ви можете відправити повідомлення користувачу @{username}"
+                   await query.message.reply_text(message)
+               else:
+                   await query.message.reply_text(
+                       "На жаль, у цього користувача немає доступного username в Telegram."
+                   )
+
+               # Повертаємося до головного меню
+               keyboard = [
+                   [KeyboardButton("👤 Дивитись анкети")],
+                   [KeyboardButton("❤️ Мої лайки")],
+                   [KeyboardButton("📝 Мої пари")],
+                   [KeyboardButton("⚙️ Налаштування")]
+               ]
+               reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+               await query.message.reply_text("Головне меню:", reply_markup=reply_markup)
+               return VIEWING_PROFILES
+
+           elif query.data == "next":
+               # Показуємо наступну анкету
+               return await self.handle_view_profiles(update, context)
+
+           else:
+               # Невідомий callback
+               keyboard = [
+                   [KeyboardButton("👤 Дивитись анкети")],
+                   [KeyboardButton("❤️ Мої лайки")],
+                   [KeyboardButton("📝 Мої пари")],
+                   [KeyboardButton("⚙️ Налаштування")]
+               ]
+               reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+               await query.message.reply_text("Головне меню:", reply_markup=reply_markup)
+               return VIEWING_PROFILES
+
+       except Exception as e:
+           logger.error(f"General error in handle_callback_query: {e}")
+           try:
+               # Повертаємо основну клавіатуру у випадку помилки
+               keyboard = [
+                   [KeyboardButton("👤 Дивитись анкети")],
+                   [KeyboardButton("❤️ Мої лайки")],
+                   [KeyboardButton("📝 Мої пари")],
+                   [KeyboardButton("⚙️ Налаштування")]
+               ]
+               reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+               await query.message.reply_text(
+                   "Виникла помилка. Спробуйте ще раз:",
+                   reply_markup=reply_markup
+               )
+           except Exception:
+               pass  # Якщо навіть це не спрацювало, просто ігноруємо
+           return VIEWING_PROFILES
+
+def main():
+   # Створення об'єкта запиту з потрібними таймаутами
+   request = HTTPXRequest(
+       connect_timeout=30.0,
+       read_timeout=30.0,
+       write_timeout=30.0
+   )
+
+   # Створення екземпляра бота
+   bot_handler = DatingBot(TELEGRAM_TOKEN, MONGODB_URL)
+
+   # Створення application з налаштуваннями
+   application = Application.builder().token(TELEGRAM_TOKEN).request(request).build()
+
+   # Встановлюємо екземпляр бота для LikeSystem
+   bot_handler.set_bot(application.bot)
+
+   # Створення обробника розмови
+   conv_handler = ConversationHandler(
+       entry_points=[CommandHandler('start', bot_handler.start)],
+       states={
+           GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_handler.gender)],
+           PURPOSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_handler.purpose)],
+           NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_handler.name)],
+           AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_handler.age)],
+           AGE_RANGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_handler.age_range)],
+           CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_handler.city)],
+           INTERESTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_handler.interests)],
+           INSTAGRAM: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_handler.instagram)],
+           MAIN_PHOTO: [
+               MessageHandler(filters.TEXT & ~filters.COMMAND, bot_handler.choose_media_type),
+               MessageHandler(filters.PHOTO, bot_handler.main_photo),
+               MessageHandler(filters.VIDEO, bot_handler.main_video)
+           ],
+           SELFIE_PHOTO: [
+               MessageHandler(filters.PHOTO, bot_handler.selfie_photo),
+               MessageHandler(filters.Regex('^Пропустити верифікацію$'), bot_handler.skip_selfie)
+           ],
+           ADDITIONAL_PHOTO: [
+               MessageHandler(filters.PHOTO, bot_handler.additional_photo),
+               MessageHandler(filters.VIDEO, bot_handler.additional_video),
+               MessageHandler(filters.TEXT & ~filters.COMMAND, bot_handler.handle_additional_photo_choice)
+           ],
+           VIEWING_PROFILES: [
+               MessageHandler(filters.Regex('^👤 Дивитись анкети$'), bot_handler.handle_view_profiles),
+               MessageHandler(filters.Regex('^❤️ Мої лайки$'), bot_handler.view_likes),
+               MessageHandler(filters.Regex('^📝 Мої пари$'), bot_handler.view_matches),
+               MessageHandler(filters.Regex('^⚙️ Налаштування$'), bot_handler.settings)
+               # Видалено обробники для емодзі-кнопок, оскільки вони тепер InlineKeyboardButton
+           ],
+           SETTINGS: [
+               MessageHandler(filters.Regex('^💎 Преміум акаунт$'), lambda update, context: bot_handler.back_to_main_menu(update, context)),
+               MessageHandler(filters.Regex('^🚀 Буст акаунту$'), lambda update, context: bot_handler.back_to_main_menu(update, context)),
+               MessageHandler(filters.Regex('^👤 Моя анкета$'), bot_handler.show_my_profile),
+               MessageHandler(filters.Regex('^🗑️ Видалити анкету$'), bot_handler.confirm_delete_profile),
+               MessageHandler(filters.Regex('^🔙 Назад$'), bot_handler.back_to_main_menu)
+           ],
+           MY_PROFILE: [
+               MessageHandler(filters.Regex('^🔄 Заповнити анкету наново$'), bot_handler.confirm_restart_profile),
+               MessageHandler(filters.Regex('^📸 Змінити фото/відео$'), bot_handler.change_profile_photo),
+               MessageHandler(filters.Regex('^✏️ Змінити текст анкети$'), bot_handler.change_bio),
+               MessageHandler(filters.Regex('^🔙 Назад$'), bot_handler.settings)
+           ],
+           CONFIRM_RESTART: [
+               MessageHandler(filters.TEXT & ~filters.COMMAND, bot_handler.handle_restart_confirmation)
+           ],
+           CONFIRM_DELETE: [
+               MessageHandler(filters.TEXT & ~filters.COMMAND, bot_handler.handle_delete_confirmation)
+           ],
+           CHANGE_PHOTO: [
+               MessageHandler(filters.TEXT & ~filters.COMMAND, bot_handler.handle_change_photo_choice),
+               MessageHandler(filters.PHOTO, bot_handler.update_profile_photo),
+               MessageHandler(filters.VIDEO, bot_handler.update_profile_video)
+           ],
+           CHANGE_BIO: [
+               MessageHandler(filters.Regex('^Змінити ім\'я$'), bot_handler.edit_name),
+               MessageHandler(filters.Regex('^Змінити вік$'), bot_handler.edit_age),
+               MessageHandler(filters.Regex('^Змінити місто$'), bot_handler.edit_city),
+               MessageHandler(filters.Regex('^Змінити опис$'), bot_handler.edit_interests),
+               MessageHandler(filters.Regex('^Змінити Instagram$'), bot_handler.edit_instagram),
+               MessageHandler(filters.Regex('^🔙 Назад$'), bot_handler.show_my_profile)
+           ],
+           EDIT_NAME: [
+               MessageHandler(filters.TEXT & ~filters.COMMAND, bot_handler.save_name)
+           ],
+           EDIT_AGE: [
+               MessageHandler(filters.TEXT & ~filters.COMMAND, bot_handler.save_age)
+           ],
+           EDIT_CITY: [
+               MessageHandler(filters.TEXT & ~filters.COMMAND, bot_handler.save_city)
+           ],
+           EDIT_INTERESTS: [
+               MessageHandler(filters.TEXT & ~filters.COMMAND, bot_handler.save_interests)
+           ],
+           EDIT_INSTAGRAM: [
+               MessageHandler(filters.TEXT & ~filters.COMMAND, bot_handler.save_instagram)
+           ]
+       },
+       fallbacks=[CommandHandler('start', bot_handler.start)]
+   )
+
+   # Додавання обробників
+   application.add_handler(conv_handler)
+   application.add_handler(CallbackQueryHandler(bot_handler.handle_callback_query))
+
+   # Запуск бота з обробкою помилок
+   logger.info("Запуск бота...")
+
+   max_retries = 5
+   retry_count = 0
+
+   while retry_count < max_retries:
+       try:
+           application.run_polling()
+           break
+       except (TimedOut, NetworkError) as e:
+           retry_count += 1
+           logger.error(f"Помилка мережі: {e}. Спроба {retry_count} з {max_retries}")
+           time.sleep(5)  # Чекаємо 5 секунд перед новою спробою
+
+if __name__ == '__main__':
+   main()
